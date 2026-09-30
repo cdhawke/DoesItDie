@@ -28,6 +28,12 @@ be displayed but not compared or used in math. Verified in-game on the 1.60.1 be
 
 Registering `COMBAT_LOG_EVENT_UNFILTERED` is forbidden: it raises a "blocked action" popup even under `pcall`.
 
+Midnight's curve APIs exist (`C_CurveUtil.CreateCurve/CreateColorCurve`, `Enum.LuaCurveType.Step`), but
+`curve:Evaluate(secret)` errors from addon code ("Secret values are only allowed during untainted execution"),
+even out of combat. Secret values only reach a curve through Blizzard functions such as
+`UnitHealthPercent(unit, false, curve)`, which fits a fixed percent (execute range) but not the kill icon: its
+threshold, damage / max health, can't be computed. Tested with `/did exec` icon C on 2026-09-24.
+
 Consequences for the design:
 
 - **The addon never computes "will it die" itself.** It feeds secret values straight into `StatusBar` widgets,
@@ -46,6 +52,9 @@ Consequences for the design:
 | `DoesItDie/DoesItDie.lua` | The addon, in sections: constants and tables, helpers, description parsing, DoT tracking (combo points, cast outcomes, tick matching), display, settings and what `Options.lua` needs (`ns.*`), events, slash commands |
 | `DoesItDie/Options.lua` | The options window: live preview with a mock target frame, tabs, presets, hand-built controls; plus a small page in Options > AddOns that opens it. Shares data with `DoesItDie.lua` through the addon namespace (`local _, ns = ...`) |
 | `DoesItDie/Nameplates.lua` | The marker and a small kill icon on every enemy nameplate with your DoTs (per-plate widgets parented to Blizzard's recycled plate frames and anchored to Platynator's health bar when it draws the plate, else Blizzard's; fed via `ns.dotBreakdownForUnit`), with their own look settings (`plate*`, since enemy plates are red) and a mock plate in the options preview; plus the `/did plates` probe. Probe verified plates are reachable and anchorable in the open world, in and out of combat; dungeons are untested |
+| `DoesItDie/Frames.lua` | Custom target frame (options' Advanced tab): attach the marker and kill icon to another addon's target frame instead of Blizzard's (which unit frame replacements hide). Settings hold frame paths (`GlobalName.key.key`); a Pick mode highlights and takes the frame under the mouse. The marker only needs the bar's rectangle, so the bar must fill left to right and be exactly the fill area. When the attached frame (custom or Blizzard's) isn't visible, the display hides. Unverified in-game |
+| `DoesItDie/Nameplates.lua` | The marker and a small kill icon on every enemy nameplate with your DoTs (per-plate widgets parented to Blizzard's recycled plate frames, fed via `ns.dotBreakdownForUnit`), with their own look settings (`plate*`, since enemy plates are red) and a mock plate in the options preview; plus the `/did plates` probe. Probe verified plates are reachable and anchorable in the open world, in and out of combat; dungeons are untested |
+| `DoesItDie/Execute.lua` | Execute range: a general "target is below 20%" indicator for every class (no class-specific logic, by design). For now only the `/did exec [percent]` probe, comparing two ways to show it: A, geometry (an icon at the threshold's spot on a long health-fed bar, clipped to the bar's empty part) and B, `UnitHealthPercent` with a step color curve, if Forever has it. Unverified in-game |
 | `DoesItDie/Textures/` | Generated TGAs: patterns (dashes, stripes, spark, shine) and the sunglasses icon |
 | `tools/make_textures.py` | Regenerates the textures |
 | `tools/scrape_forever_spellbook.py` | Scrapes all nine class spellbooks from foreverchanges.pro into `tools/data/forever_spellbook.json` |
@@ -60,16 +69,22 @@ Consequences for the design:
 
 1. **Cast** (`UNIT_SPELLCAST_SUCCEEDED`, player only): parse the description (`parseDot`). Skip ignored spells
    (AoE, channels, traps, delayed damage), heals and weapon poisons. Finishers (Rip, Rupture) read the
-   per-combo-point table.
+   per-combo-point table. The DoT goes on the mob that was targeted at `UNIT_SPELLCAST_SENT` (matched by cast
+   GUID): players who tab-dot have often changed target by the time an instant's cast event arrives.
 2. **Combo points** are secret, so they're **counted** from builders ("Awards N combo point"), with dodges and
    misses taken back and resets on finishers and target changes. If unknown, finishers assume the lowest entry.
-3. **Cast outcomes:** a dodge/parry/miss/resist/immune on the target right after a cast removes that DoT (or
+3. **Cast outcomes:** a dodge/parry/miss/resist/immune on the cast's mob right after a cast removes that DoT (or
    restores the previous one on a recast). `UNIT_COMBAT` doesn't say which attack was avoided; the first outcome
-   right after the cast decides.
+   right after the cast decides. For spell (non-Physical) DoTs, the pet's melee is the usual culprit: dodges and
+   parries are ignored, and a miss/resist not reported in the spell's school makes a new DoT wait for its first
+   tick instead of dropping it. (Which school `UNIT_COMBAT` reports for a spell's own miss is unverified; AVOID
+   log lines include it.)
 4. **Ticks:** each `UNIT_COMBAT` hit on the target is matched to at most one DoT: same school, within a tight
    timing window of the DoT's rhythm, and a plausible size (crits 1.3–2.3×). Physical bleeds and melee white hits
    look alike, hence the tight windows. Learned tick sizes are saved per spell (per combo point count for
-   finishers).
+   finishers). A DoT that never ticks is dropped after two missed ticks, but only ticks that could have been
+   seen count: `UNIT_COMBAT` only covers the target, focus and visible nameplates, so a mob you tabbed away from
+   keeps its DoTs until they expire.
 5. **Display** (every 0.1s): the remaining damage of all DoTs on the target goes to the marker and the skull.
 
 Tuning constants (tick windows, tolerances, fallbacks) are at the top of `DoesItDie.lua` with the reasoning.
@@ -84,7 +99,8 @@ Tuning constants (tick windows, tolerances, fallbacks) are at the top of `DoesIt
   `…\_classic_beta_\WTF\Account\<account>\SavedVariables\DoesItDie.lua`. Reading this after the user plays is
   the main debugging loop. `/did debug` echoes the log to chat.
 - **Slash commands:** `/did` (options window), `/did skull` (5-second kill icon test with geometry logged), `/did line`,
-  `/did debug`, `/did reset` (forget learned tick sizes), `/did plates` (nameplate probe, logged).
+  `/did debug`, `/did reset` (forget learned tick sizes), `/did plates` (nameplate probe, logged), `/did exec [percent]`
+  (execute range probe, logged; again to stop).
 - **Tests:** `pip install lupa`, then run the five `tools/test_*.py` scripts (use `--update` on
   `test_spellbook.py` only after reviewing a change). There's no Lua install; `luaparser` (pip) works as a
   syntax check.
@@ -94,7 +110,7 @@ Tuning constants (tick windows, tolerances, fallbacks) are at the top of `DoesIt
     `"Interface\\Buttons\\WHITE8X8"`. Edit Lua with file tools, and grep `Interface` after scripted edits.
   - Guard every value that might be secret with `isSecret()` before comparing or indexing with it.
   - Bump `DB_VERSION` when learned tick data from older versions would be wrong.
-  - Lua allows 200 locals per function scope, including a file's top level. `DoesItDie.lua` is around 170,
+  - Lua allows 200 locals per function scope, including a file's top level. `DoesItDie.lua` is around 186,
     so new features with many top-level locals belong in a new file (added to the .toc) sharing `ns`.
 
 ## Status

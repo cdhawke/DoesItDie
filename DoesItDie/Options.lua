@@ -188,7 +188,7 @@ end
 ---------------------------------------------------------------------------
 
 local function changed()
-    ns.refresh()
+    ns.reattach() -- refreshes; re-attaches only if a custom frame setting changed what to attach to
     refreshControls()
 end
 
@@ -395,6 +395,59 @@ local function pushButton(parent, text, width, onClick)
     return button
 end
 
+-- A frame path setting (Frames.lua): a text box (saved on Enter or leaving it) and a Pick button that takes the
+-- next click on screen.
+local function frameRow(parent, key, labelText, kind, opts)
+    opts = opts or {}
+    local row = makeRow(parent, labelText, opts)
+    local box = CreateFrame("EditBox", nil, row, "BackdropTemplate")
+    box:SetSize(row.layout.control - 58, 22)
+    box:SetPoint("LEFT", row, "LEFT", row.layout.label, 0)
+    setBackdrop(box, 0.13)
+    box:SetFontObject("GameFontHighlightSmall")
+    box:SetTextInsets(6, 6, 0, 0)
+    box:SetAutoFocus(false)
+    local function save(value)
+        db()[key] = strtrim(value or "")
+        changed()
+    end
+    box:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
+    box:SetScript("OnEscapePressed", function(self)
+        self:SetText(db()[key])
+        self:ClearFocus()
+    end)
+    box:SetScript("OnEditFocusLost", function(self)
+        if strtrim(self:GetText() or "") ~= db()[key] then save(self:GetText()) end
+    end)
+    local pick = pushButton(row, "Pick", 52, function()
+        ns.print("Click " .. (kind == "bar" and "your target's health bar" or "where the kill icon should go")
+            .. " (you may need to move this window). Right-click cancels.")
+        ns.startFramePick(kind, function(path)
+            box:SetText(path)
+            save(path)
+            ns.print("Picked " .. path .. ".")
+        end)
+    end)
+    pick:SetPoint("LEFT", box, "RIGHT", 6, 0)
+    function row:Refresh()
+        if not box:HasFocus() then box:SetText(db()[key] or "") end
+        self:ApplyEnabled(box)
+    end
+    return row
+end
+
+-- A line of text in the settings column, from getText().
+local function infoRow(parent, labelText, getText, opts)
+    opts = opts or {}
+    local row = makeRow(parent, labelText, opts)
+    local text = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    text:SetPoint("LEFT", row, "LEFT", row.layout.label, 0)
+    text:SetWidth(row.layout.control + 40)
+    text:SetJustifyH("LEFT")
+    function row:Refresh() text:SetText(getText()) end
+    return row
+end
+
 local function actionRow(parent, labelText, buttonText, onClick, opts)
     opts = opts or {}
     local row = makeRow(parent, labelText, opts)
@@ -432,13 +485,14 @@ local function addTab(name)
     local button = CreateFrame("Button", nil, area)
     button.text = button:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     button.text:SetText(name)
-    button:SetSize(button.text:GetStringWidth() + 20, 26)
+    -- Tight padding: seven tabs have to fit the settings area's width.
+    button:SetSize(button.text:GetStringWidth() + 12, 26)
     button.text:SetPoint("CENTER")
     button.underline = button:CreateTexture(nil, "ARTWORK")
     button.underline:SetColorTexture(1, 0.82, 0, 1)
     button.underline:SetHeight(2)
-    button.underline:SetPoint("BOTTOMLEFT", 6, 0)
-    button.underline:SetPoint("BOTTOMRIGHT", -6, 0)
+    button.underline:SetPoint("BOTTOMLEFT", 3, 0)
+    button.underline:SetPoint("BOTTOMRIGHT", -3, 0)
     local previous = tabs[#tabs]
     if previous then
         button:SetPoint("LEFT", previous.button, "RIGHT", 2, 0)
@@ -458,6 +512,8 @@ local function addTab(name)
     function tab:slider(key, ...) return place(slider(self.content, key, ...), key) end
     function tab:choice(key, ...) return place(choice(self.content, key, ...), key) end
     function tab:action(...) return place(actionRow(self.content, ...)) end
+    function tab:frame(key, ...) return place(frameRow(self.content, key, ...), key) end
+    function tab:info(...) return place(infoRow(self.content, ...)) end
     function tab:gap() self.y = self.y + 8 end
 
     table.insert(tabs, tab)
@@ -494,10 +550,11 @@ local function buildTabs()
     icon:choice("skullIcon", "Icon", lists.icons)
     icon:slider("skullSize", "Size", 20, 64, 2)
     icon:checkbox("skullPulse", "Pulse", { tooltip = "Gently pulses the icon while it's showing." })
-    icon:slider("skullOffsetX", "Horizontal offset", -60, 60, 1,
-        { tooltip = "Pixels right (+) or left (-) of the portrait's center." })
-    icon:slider("skullOffsetY", "Vertical offset", -60, 60, 1,
-        { tooltip = "Pixels up (+) or down (-) from the portrait's center." })
+    -- Wide ranges: with a custom target frame (Advanced) the icon may be centered on a long health bar.
+    icon:slider("skullOffsetX", "Horizontal offset", -150, 150, 1,
+        { tooltip = "Pixels right (+) or left (-) of the portrait's center (or the custom spot's, see Advanced)." })
+    icon:slider("skullOffsetY", "Vertical offset", -150, 150, 1,
+        { tooltip = "Pixels up (+) or down (-) from the portrait's center (or the custom spot's, see Advanced)." })
 
     local marker = addTab("Marker")
     marker:checkbox("showMarkers", "Show damage marker", { tooltip = "Marks the damage your DoTs still have to "
@@ -578,14 +635,25 @@ local function buildTabs()
     plates.footer:SetPoint("BOTTOMLEFT", 10, 10)
     plates.footer:Hide()
 
-    local behavior = addTab("Behavior")
-    behavior:choice("waitFirstTick", "Wait for first tick", lists.waitModes, { tooltip = "Whether a new DoT "
+    local advanced = addTab("Advanced")
+    advanced:choice("waitFirstTick", "Wait for first tick", lists.waitModes, { tooltip = "Whether a new DoT "
         .. "counts before its first tick lands. \"When unsure\" waits for finishers with unknown combo points "
         .. "and spells the addon hasn't seen tick yet." })
-    behavior:checkbox("debug", "Echo trace log to chat",
+    advanced:checkbox("debug", "Echo trace log to chat",
         { tooltip = "Prints each DoT cast, matched tick and estimate to chat." })
-    behavior:action("Learned tick sizes", "Reset", function() ns.resetLearnedTicks() end,
+    advanced:action("Learned tick sizes", "Reset", function() ns.resetLearnedTicks() end,
         { tooltip = "Forget the tick sizes learned from earlier casts." })
+    -- Custom target frame (Frames.lua), for unit frame addons that replace Blizzard's.
+    advanced:gap()
+    advanced:gap()
+    advanced:frame("customHealthBar", "Target health bar", "bar", { tooltip = "For unit frame addons that replace "
+        .. "Blizzard's target frame. Target something, click Pick, then click its health bar. Or type the frame's "
+        .. "name (/fstack shows it). The bar must fill left to right. Leave empty for Blizzard's." })
+    advanced:frame("customIconAnchor", "Kill icon spot", "anchor", { tooltip = "Where the kill icon is centered "
+        .. "(e.g. the custom frame's portrait). Empty: Blizzard's portrait, or the custom health bar if one is set. "
+        .. "Fine-tune with the offsets on the Kill icon tab." })
+    advanced:info("Health bar in use", function() return (ns.attachStatus()) end)
+    advanced:info("Kill icon in use", function() return select(2, ns.attachStatus()) end)
 end
 
 local function buildPreview(pane)

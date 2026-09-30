@@ -51,7 +51,12 @@ function methods.Hide(self)
 end
 function methods.SetShown(self, v) if v then self:Show() else self:Hide() end end
 function methods.IsShown(self) return self.shown end
-function methods.IsVisible(self) return self.shown end
+function methods.IsVisible(self)
+    if not self.shown then return false end
+    local parent = self.parent
+    if type(parent) == "table" and parent.shown ~= nil then return methods.IsVisible(parent) end
+    return true
+end
 function methods.SetText(self, t) self.text = t end
 function methods.GetText(self) return self.text end
 function methods.SetSize(self, w, h) self.width, self.height = w, h end
@@ -88,6 +93,9 @@ function methods.GetValue(self) return self.value or 0 end
 function methods.RegisterEvent(self, e) self.events = self.events or {}; self.events[e] = true end
 function methods.RegisterUnitEvent(self, e) self.events = self.events or {}; self.events[e] = true end
 function methods.GetDebugName(self) return self.name or "mock" end
+function methods.GetName(self) return self.name end
+function methods.GetParent(self) return self.parent end
+function methods.SetAllPoints(self, target) self.allPoints = target end
 
 function CreateFrame(kind, name, parent, template)
     local f = mock(kind, parent)
@@ -244,7 +252,7 @@ step("/did opens the window", lambda: G.SlashCmdList.DOESITDIE(""))
 check("window shown", G.DoesItDieOptions.shown, True)
 step("display loop with the window's preview", lambda: H.update(0.2))
 
-for tab in ("Kill icon", "Marker", "Effects", "Text", "Nameplates", "Behavior"):
+for tab in ("Kill icon", "Marker", "Effects", "Text", "Nameplates", "Advanced"):
     step(f"open tab {tab}", lambda tab=tab: H.clickText(tab))
 
 
@@ -358,6 +366,54 @@ check("  probe summary", plate_lines[-1].split("PLATES ")[1], "probe done: 1 nam
 step("test bars hide after 8 seconds", lambda: H.update(9))
 
 
+def exec_log():
+    return [line for line in G.DoesItDieDB.log.values() if "EXEC" in line]
+
+
+def execute_bar():
+    return next((f for f in G.frames.values() if f.kind == "StatusBar" and f.width == 50000), None)
+
+
+G.targetGuid = "Creature-0-1-2-3-3099-000001"
+step("/did exec (no curve API)", lambda: (G.SlashCmdList.DOESITDIE("exec"), H.update(0.2)))
+check("  probe logged the missing curve API", any("curve: UnitHealthPercent missing" in l for l in exec_log()), True)
+check("  geometry bar fed the target's health", execute_bar().value if execute_bar() else None, 100)
+lua.execute("""
+    function UnitHealthPercent(unit, usePredicted, curve)
+        if curve then return curve:Evaluate(0.5) end
+        return 1
+    end
+    Enum.LuaCurveType = { Linear = 0, Step = 1 }
+    C_CurveUtil = { CreateColorCurve = function()
+        local c = { points = {} }
+        function c:SetType() end
+        function c:AddPoint(x, color) table.insert(self.points, { x = x, color = color }) end
+        function c:Evaluate(x)
+            local found = self.points[1].color
+            for _, p in ipairs(self.points) do if x >= p.x then found = p.color end end
+            return { a = found[4], GetRGBA = function() return unpack(found) end }
+        end
+        return c
+    end, CreateCurve = function()
+        local c = { points = {} }
+        function c:SetType() end
+        function c:AddPoint(x, y) table.insert(self.points, { x = x, y = y }) end
+        function c:Evaluate(x)
+            local found = self.points[1].y
+            for _, p in ipairs(self.points) do if x >= p.x then found = p.y end end
+            return found
+        end
+        return c
+    end }
+""")
+step("/did exec 35 (with a fake curve API)", lambda: (G.SlashCmdList.DOESITDIE("exec 35"), H.update(0.2)))
+check("  curve built at 0.35", any("threshold point at 0.35" in l for l in exec_log()), True)
+check("  no B errors", any("EXEC B error" in l for l in exec_log()), False)
+step("/did exec stops it", lambda: G.SlashCmdList.DOESITDIE("exec"))
+check("  probe off", G.DoesItDieExecuteProbe.shown, False)
+G.targetGuid = None
+
+
 def plate_children(kind):
     return [c for c in G.FakePlate.children.values() if c.kind == kind]
 
@@ -385,6 +441,88 @@ def plates_off():
 step("switch nameplates off", plates_off)
 check("  marker hidden", markers[0].shown if markers else None, False)
 check("  kill icon hidden", icon_windows[0].shown if icon_windows else None, False)
+
+step("/did exec with Corruption on the target (kill icon curve, C)",
+     lambda: (G.SlashCmdList.DOESITDIE("exec"), H.update(0.2)))
+check("  C uses the float curve", any("kill curve mode: alpha" in l for l in exec_log()), True)
+check("  C curve stepped past Corruption's 40", any("step at 40.5; plain check: alpha at 40=1, at 41=0" in l
+                                                   for l in exec_log()), True)
+check("  C applied without error", any("alpha: applied without error" in l for l in exec_log()), True)
+check("  no C errors", any("EXEC C" in l and "error:" in l for l in exec_log()), False)
+step("/did exec stops it again", lambda: G.SlashCmdList.DOESITDIE("exec"))
+
+# Custom target frame (Advanced tab), as for a unit frame addon that replaces Blizzard's target frame.
+lua.execute("""
+    local custom = CreateFrame("Frame", "MyTargetFrame", UIParent)
+    custom.Health = CreateFrame("StatusBar", nil, custom)
+""")
+custom_bar = G.MyTargetFrame.Health
+check("frame path of an unnamed child found by its key", ns.framePath(custom_bar), "MyTargetFrame.Health")
+same = lua.eval("function(a, b) return rawequal(a, b) end")
+check("  and resolves back to it", same(ns.resolveFramePath("MyTargetFrame.Health"), custom_bar), True)
+check("  a missing path resolves to nothing", ns.resolveFramePath("NoSuchFrame.Health"), None)
+
+
+def type_frame_path(label, text):
+    def run():
+        box = H.rowWidget(label, "EditBox")
+        box.SetText(box, text)
+        box.scripts.OnEditFocusLost(box)
+    return run
+
+
+step("type a custom health bar path", type_frame_path("Target health bar", "MyTargetFrame.Health"))
+check("  saved", G.DoesItDieDB.customHealthBar, "MyTargetFrame.Health")
+step("display loop on the custom frame", lambda: H.update(0.2))
+check("  marker laid over the custom health bar", same(G.DoesItDieRemaining.allPoints, custom_bar), True)
+check("  status shows it in use", "MyTargetFrame.Health" in ns.attachStatus()[0], True)
+check("  marker still showing Corruption", G.DoesItDieRemaining.shown, True)
+
+
+def hide_custom_frame():
+    G.MyTargetFrame.Hide(G.MyTargetFrame)
+    H.update(0.2)
+
+
+step("custom target frame hidden", hide_custom_frame)
+check("  marker hidden with it", G.DoesItDieRemaining.shown, False)
+G.MyTargetFrame.Show(G.MyTargetFrame)
+step("type a path that doesn't exist", type_frame_path("Target health bar", "Gone.Health"))
+check("  status says not found", "not found" in ns.attachStatus()[0], True)
+step("clear it", type_frame_path("Target health bar", ""))
+check("  back to Blizzard's", ns.attachStatus()[0], "Blizzard's target frame")
+step("Pick button starts pick mode", lambda: H.clickText("Pick"))
+step("  a right-click cancels it", lambda: H.fire("GLOBAL_MOUSE_DOWN", "RightButton"))
+
+# In-game, IsMouseOver on Blizzard's target frame textures returned a secret boolean and every pick update errored
+# (Frames.lua:96, 57 times). Secret values here are a sentinel that issecretvalue recognizes.
+lua.execute("""
+    SECRET = setmetatable({}, { __tostring = function() return "<secret>" end })
+    function issecretvalue(v) return v == SECRET end
+    local frame, bar = MyTargetFrame, MyTargetFrame.Health
+    function frame:GetChildren() return bar end
+    function frame:GetRect() return 0, 0, 200, 40 end
+    function frame:IsMouseOver() return SECRET end
+    function bar:GetObjectType() return "StatusBar" end
+    function bar:GetRect() return 10, 10, 150, 12 end
+    function bar:IsMouseOver() return SECRET end
+    function bar:GetEffectiveScale() return 1 end
+    function frame:GetEffectiveScale() return 1 end
+    function GetCursorPosition() return 50, 15 end
+    function GetMouseFoci() return { frame } end
+""")
+
+
+def pick_with_secret_mouseover():
+    H.clickText("Pick")  # the health bar row's
+    H.update(0.1)
+    H.fire("GLOBAL_MOUSE_DOWN", "LeftButton")
+
+
+step("Pick over a bar whose IsMouseOver is secret: no error", pick_with_secret_mouseover)
+check("  falls back to the rectangle and picks the bar", G.DoesItDieDB.customHealthBar, "MyTargetFrame.Health")
+check("  no pick error logged", any("ERROR in frame pick" in l for l in G.DoesItDieDB.log.values()), False)
+lua.execute("issecretvalue = nil")
 
 print(f"\n{'all passed' if not failures else str(failures) + ' FAILED'}")
 sys.exit(1 if failures else 0)

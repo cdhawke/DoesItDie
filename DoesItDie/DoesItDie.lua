@@ -20,6 +20,12 @@ local DEFAULT_TICK_INTERVAL = 3
 local TICK_MATCH_WINDOW = 0.45
 local TICK_MATCH_WINDOW_ANCHORED = 0.25
 local MISSED_TICKS_BEFORE_DROP = 2  -- a DoT that never ticks was resisted/immune
+-- Projectile DoTs start when the projectile lands, not on the cast event: Serpent Sting's first tick came
+-- 3.6-3.9s after the cast instead of 3s (log 253548.7, 12 casts). Their first tick may be this much later.
+local PROJECTILE_TRAVEL = 1.5
+local PROJECTILE_DOTS = {
+    ["Serpent Sting"] = true, ["Fireball"] = true, ["Pyroblast"] = true, ["Frostfire Bolt"] = true,
+}
 -- Once a DoT's tick size is known, same-school hits further off than this are someone else's (the Imp's
 -- Firebolt next to Immolate, white hits next to Rip). Ticks within one cast barely vary (15,15,15,16);
 -- the minimum slack of 1 covers rounding (3 vs 4).
@@ -109,6 +115,10 @@ local DEFAULTS = {
     labelColor = "white",
     -- Misc
     debug = false,
+    -- Custom frames (Frames.lua): another addon's target health bar / kill icon spot, as frame paths. Empty =
+    -- Blizzard's target frame.
+    customHealthBar = "",
+    customIconAnchor = "",
     -- Accuracy
     waitFirstTick = "off",
     -- Nameplates (Nameplates.lua): their own look, since enemy plates are red. Defaults read well on red.
@@ -292,9 +302,10 @@ local function tickShape(dot, number)
 end
 
 -- A waiting DoT doesn't count toward the marker until its first tick lands (see WAIT_MODES).
+-- A doubtful DoT (an avoid right after the cast that may not have been its own) always waits.
 local function isWaiting(dot)
     if dot.ticksSeen > 0 then return false end
-    if db.waitFirstTick == "always" then return true end
+    if dot.doubtful or db.waitFirstTick == "always" then return true end
     return db.waitFirstTick == "unsure" and dot.unsure
 end
 
@@ -318,9 +329,16 @@ local OUTCOME_LOOKBACK = 0.25
 local AVOIDED_ACTIONS = {
     MISS = true, DODGE = true, PARRY = true, EVADE = true, IMMUNE = true, DEFLECT = true, RESIST = true, REFLECT = true,
 }
-local lastBuilder    -- { points, at }: builder whose outcome isn't known yet
+-- Spells can't be dodged or parried: next to a spell DoT, these were someone's melee (usually the pet's).
+local MELEE_ONLY_AVOIDS = { DODGE = true, PARRY = true, DEFLECT = true }
+local lastBuilder    -- { key, points, at }: builder whose outcome isn't known yet
 local lastDotCast    -- { key, name, dot, previous, at }: DoT cast whose outcome isn't known yet
-local lastOutcome    -- { avoided, action, at }: most recent outcome on the target
+local lastOutcome    -- { key, avoided, action, school, at }: most recent outcome on a mob
+-- The mob each cast was aimed at, by cast GUID, taken when the cast is sent. An instant DoT's
+-- UNIT_SPELLCAST_SUCCEEDED comes a server round trip later, and a player who tabs to the next mob straight
+-- away has changed target by then: the DoT used to be put on the new target.
+local sentTargets = {} -- castGUID -> { key, at }
+local SENT_TARGET_SECONDS = 10
 
 local function describeReading(ok, value)
     if not ok then return "error" end
@@ -353,7 +371,12 @@ local function isFinisherDescription(desc)
     return type(desc) == "string" and not isSecret(desc) and desc:find("Finishing move") ~= nil
 end
 
-local function onCastSent(spellID)
+local function onCastSent(spellID, castGUID)
+    local now = GetTime()
+    for guid, sent in pairs(sentTargets) do
+        if now - sent.at > SENT_TARGET_SECONDS then sentTargets[guid] = nil end
+    end
+    if castGUID and not isSecret(castGUID) then sentTargets[castGUID] = { key = unitKey("target"), at = now } end
     local ok, _, desc = pcall(spellNameAndDescription, spellID)
     if not ok or not isFinisherDescription(desc) then return end
     local points, readings = readComboPoints()
@@ -361,64 +384,99 @@ local function onCastSent(spellID)
     trace("COMBO at send: " .. readings .. ", counted=" .. countedPoints)
 end
 
--- An avoid that arrived just before the cast event (see OUTCOME_LOOKBACK), or nil.
-local function avoidJustBefore()
-    if lastOutcome and lastOutcome.avoided and GetTime() - lastOutcome.at <= OUTCOME_LOOKBACK then
-        return lastOutcome.action
+-- The mob a cast went to: the target when it was sent, else (no send seen) the target now.
+local function castTargetKey(castGUID)
+    local sent = castGUID and not isSecret(castGUID) and sentTargets[castGUID]
+    if not sent then return unitKey("target") end
+    sentTargets[castGUID] = nil
+    return sent.key
+end
+
+-- An avoid on `key` that arrived just before the cast event (see OUTCOME_LOOKBACK), or nil.
+local function avoidJustBefore(key)
+    if lastOutcome and lastOutcome.avoided and lastOutcome.key == key
+        and GetTime() - lastOutcome.at <= OUTCOME_LOOKBACK then
+        return lastOutcome
     end
 end
 
 -- A builder was cast: count its points unless it was already avoided, else wait for its outcome.
-local function onBuilderCast(points)
-    local avoided = avoidJustBefore()
+local function onBuilderCast(key, points)
+    local avoided = avoidJustBefore(key)
     if avoided then
-        trace("COMBO builder " .. avoided .. " (before cast event), counted=" .. countedPoints)
+        trace("COMBO builder " .. avoided.action .. " (before cast event), counted=" .. countedPoints)
         return
     end
     countedPoints = math.min(COMBO_CAP, countedPoints + points)
-    lastBuilder = { points = points, at = GetTime() }
+    lastBuilder = { key = key, points = points, at = GetTime() }
 end
 
 -- A DoT cast whose result was avoided isn't on the target: drop it. (Waiting for a first tick to prove it
 -- instead doesn't work for bleeds: melee white hits look just like ticks.) A recast replaced a DoT that is
 -- still ticking, so that one is put back.
-local function removeAvoidedDot(cast, action)
+-- Spell DoTs are different: the pet and other players' melee miss all the time, and their ticks are told apart
+-- from melee by school. So an avoid that can't be the spell's is ignored, and one that might not be (not
+-- reported in the spell's school) makes a new DoT wait for its first tick instead of dropping it.
+-- Returns false if the avoid was ignored, so the cast's own outcome may still come.
+local function removeAvoidedDot(cast, action, school)
+    local dot = cast.dot
     local dots = dotsByTarget[cast.key]
-    if not dots or dots[cast.name] ~= cast.dot then return end
+    if not dots or dots[cast.name] ~= dot then return true end
+    local spellSchool = type(school) == "number" and not isSecret(school) and school == dot.school
+    if dot.school ~= SCHOOL_MASKS.Physical and not spellSchool then
+        if MELEE_ONLY_AVOIDS[action] then
+            trace(string.format("AVOID %s (school %s) right after %s: not the spell, ignored", action,
+                tostring(school), cast.name))
+            return false
+        end
+        if not cast.previous then
+            dot.doubtful = true
+            trace(string.format("AVOID %s (school %s) right after %s: may be someone else's, waiting for its first tick",
+                action, tostring(school), cast.name))
+            return true
+        end
+    end
     if cast.previous then
         dots[cast.name] = cast.previous
-        trace("AVOID " .. action .. " right after " .. cast.name .. " recast; keeping the earlier one")
+        trace(string.format("AVOID %s (school %s) right after %s recast; keeping the earlier one", action,
+            tostring(school), cast.name))
     else
         dots[cast.name] = nil
-        trace("AVOID " .. action .. " right after " .. cast.name .. "; dropped")
+        trace(string.format("AVOID %s (school %s) right after %s; dropped", action, tostring(school), cast.name))
     end
+    return true
 end
 
-local function onTargetAvoided(action)
+local function onAvoided(key, action, school)
     local now = GetTime()
-    lastOutcome = { avoided = true, action = action, at = now }
-    if lastBuilder and now - lastBuilder.at <= OUTCOME_WINDOW then
-        countedPoints = math.max(0, countedPoints - lastBuilder.points)
-        trace("COMBO builder " .. action .. ", counted=" .. countedPoints)
+    lastOutcome = { key = key, avoided = true, action = action, school = school, at = now }
+    if lastBuilder and lastBuilder.key == key then
+        if now - lastBuilder.at <= OUTCOME_WINDOW then
+            countedPoints = math.max(0, countedPoints - lastBuilder.points)
+            trace("COMBO builder " .. action .. ", counted=" .. countedPoints)
+        end
+        lastBuilder = nil
     end
-    if lastDotCast and now - lastDotCast.at <= OUTCOME_WINDOW then
-        removeAvoidedDot(lastDotCast, action)
+    if lastDotCast and lastDotCast.key == key then
+        if now - lastDotCast.at > OUTCOME_WINDOW or removeAvoidedDot(lastDotCast, action, school) then
+            lastDotCast = nil
+        end
     end
-    lastBuilder, lastDotCast = nil, nil
 end
 
--- A hit on the target: the pending casts landed (a later avoid belongs to something else).
-local function onTargetHit()
-    lastOutcome = { avoided = false, at = GetTime() }
-    lastBuilder, lastDotCast = nil, nil
+-- A hit on a mob: the pending casts on it landed (a later avoid belongs to something else). For a spell DoT
+-- only a hit in its school says so (Immolate's direct damage); a melee hit is someone else's.
+local function onHit(key, school)
+    lastOutcome = { key = key, avoided = false, at = GetTime() }
+    if lastBuilder and lastBuilder.key == key then lastBuilder = nil end
+    if lastDotCast and lastDotCast.key == key
+        and (lastDotCast.dot.school == SCHOOL_MASKS.Physical or lastDotCast.dot.school == school) then
+        lastDotCast = nil
+    end
 end
 
 local function resetComboCount()
     countedPoints, lastBuilder = 0, nil
-end
-
-local function forgetPendingOutcomes()
-    lastBuilder, lastDotCast, lastOutcome = nil, nil, nil
 end
 
 -- Returns points and where they came from, or nil and "unknown".
@@ -439,12 +497,13 @@ local function comboPointsForCast()
 end
 
 -- Returns the target key the DoT was applied to, or nil if the cast wasn't a tracked DoT.
-local function onPlayerCast(spellID)
+local function onPlayerCast(spellID, castGUID)
+    local key = castTargetKey(castGUID)
     local ok, name, desc = pcall(spellNameAndDescription, spellID)
     if not ok or not name or isSecret(name) then return end
     if type(desc) == "string" and not isSecret(desc) then
         local awarded = tonumber(desc:match("Awards (%d+) combo point"))
-        if awarded then onBuilderCast(awarded) end
+        if awarded then onBuilderCast(key, awarded) end
     end
     if IGNORED_SPELLS[name] then return end
     local isFinisher = isFinisherDescription(desc)
@@ -457,7 +516,6 @@ local function onPlayerCast(spellID)
     local tickKey = spellID
     if isFinisher then tickKey = comboPoints and (spellID .. "x" .. comboPoints) or nil end
 
-    local key = unitKey("target")
     if not key then return end
 
     local now = GetTime()
@@ -474,6 +532,7 @@ local function onPlayerCast(spellID)
         interval = interval,
         totalTicks = math.max(1, math.floor(duration / interval + 0.5)),
         shape = TICK_SHAPES[name],
+        travel = PROJECTILE_DOTS[name] and PROJECTILE_TRAVEL or nil,
         appliedAt = now,
         expiresAt = now + duration,
         nextTickAt = now + interval,
@@ -488,14 +547,15 @@ local function onPlayerCast(spellID)
     -- The starting estimate is shaky without a learned tick size (description numbers leave out spell power
     -- and attack power) or, for finishers, without knowing the combo points.
     dot.unsure = not learned
-    trace(string.format("CAST %s (id %d)%s: %d dmg over %ss, school %d, tick every %ss, per-tick %s%s", name, spellID,
+    trace(string.format("CAST %s (id %d)%s: %d dmg over %ss, school %d, tick every %ss, per-tick %s%s%s", name, spellID,
         isFinisher and string.format(" %s combo points (%s)", comboPoints or "?", comboSource) or "",
         total, duration, school, interval, learned and ("learned " .. learned) or "from description",
-        isWaiting(dot) and ", waiting for first tick" or ""))
-    local avoided = avoidJustBefore()
-    if avoided then
-        removeAvoidedDot(lastDotCast, avoided)
+        isWaiting(dot) and ", waiting for first tick" or "",
+        key ~= unitKey("target") and (" on " .. tostring(key) .. ", the target when sent") or ""))
+    local avoided = avoidJustBefore(key)
+    if avoided and removeAvoidedDot(lastDotCast, avoided.action, avoided.school) then
         lastDotCast = nil
+        if dotsByTarget[key] and dotsByTarget[key][name] == dot then return key, isWaiting(dot) end
         return nil
     end
     return key, isWaiting(dot)
@@ -506,7 +566,12 @@ end
 -- Using the nearest multiple of the interval means one missed tick doesn't lose the DoT.
 local function distanceToExpectedTick(dot, now)
     local anchor = dot.firstTickAt or dot.appliedAt
-    local k = math.max(1, math.floor((now - anchor) / dot.interval + 0.5))
+    if not dot.firstTickAt and dot.travel then
+        -- Still in flight: the DoT started anywhere up to `travel` seconds after the cast.
+        local late = now - (anchor + dot.interval)
+        if late > 0 then anchor = anchor + math.min(late, dot.travel) end
+    end
+    local k =math.max(1, math.floor((now - anchor) / dot.interval + 0.5))
     return math.abs(now - (anchor + k * dot.interval)), k
 end
 
@@ -548,6 +613,8 @@ local function anchorTick(dot, index, now)
         dot.lastTickIndex = index
     else
         dot.firstTickAt, dot.lastTickIndex = now, 0
+        -- A projectile DoT started when it landed: count its ticks from there.
+        if dot.travel then dot.appliedAt = now - index * dot.interval end
     end
     dot.lastTickAt = now
     dot.nextTickAt = now + dot.interval
@@ -610,14 +677,13 @@ end
 local lastCombatSignature
 local function onUnitCombat(unit, action, flag, amount, school)
     if isSecret(action) then return end
-    if unit == "target" then
-        if AVOIDED_ACTIONS[action] then return onTargetAvoided(action) end
-        if action == "WOUND" then onTargetHit() end
-    end
-    if action ~= "WOUND" or isSecret(amount) or isSecret(school) or type(amount) ~= "number" then return end
-    local isCrit = not isSecret(flag) and flag == "CRITICAL"
+    if not AVOIDED_ACTIONS[action] and action ~= "WOUND" then return end
     local key = unitKey(unit)
     if not key then return end
+    if AVOIDED_ACTIONS[action] then return onAvoided(key, action, school) end
+    onHit(key, school)
+    if isSecret(amount) or isSecret(school) or type(amount) ~= "number" then return end
+    local isCrit = not isSecret(flag) and flag == "CRITICAL"
     local dots = dotsByTarget[key]
     if not dots then return end
 
@@ -673,12 +739,26 @@ local function onUnitCombat(unit, action, flag, amount, school)
     if wasWaiting then return key end
 end
 
+-- Whether hits on a mob reach the addon right now. UNIT_COMBAT only reports unit tokens (the target, focus and
+-- visible nameplates), so a mob you tabbed away from, with nameplates off or out of their range, ticks unseen.
+-- Its DoTs used to be dropped as "never ticked", which lost every earlier mob when chain pulling.
+local function isObservable(key)
+    if unitKey("target") == key or unitKey("focus") == key then return true end
+    for i = 1, 40 do
+        local unit = "nameplate" .. i
+        if UnitExists(unit) and unitKey(unit) == key then return true end
+    end
+    return false
+end
+
 local function housekeep(now)
     for key, dots in pairs(dotsByTarget) do
         for name, dot in pairs(dots) do
-            while dot.nextTickAt < now - TICK_MATCH_WINDOW and dot.nextTickAt <= dot.expiresAt do
+            local late = (dot.ticksSeen == 0 and dot.travel) or 0
+            while dot.nextTickAt < now - TICK_MATCH_WINDOW - late and dot.nextTickAt <= dot.expiresAt do
                 dot.nextTickAt = dot.nextTickAt + dot.interval
-                dot.missed = dot.missed + 1
+                -- Only a tick that could have been seen counts as missed.
+                if dot.ticksSeen == 0 and isObservable(key) then dot.missed = dot.missed + 1 end
             end
             if now > dot.expiresAt + TICK_MATCH_WINDOW then
                 dots[name] = nil
@@ -1365,14 +1445,33 @@ local function regionName(region)
     return ok and tostring(name) or "found (unnamed)"
 end
 
-local function attach()
-    local portrait, bar
+-- The frame whose visibility decides whether the display shows (a hidden target frame means the marker would
+-- float over nothing), and the top-level frame to layer above. Both follow the attached frames.
+local visibilityFrame, layerRoot
+local attachedSignature
+
+-- Attaches the display to the preview, the custom frames (Advanced options) or Blizzard's target frame.
+-- Without `force`, only re-attaches if the frames to use changed (custom frames may be created late, or
+-- rebuilt by their addon), so it's cheap to call on every target change.
+local function attach(force)
+    local portrait, bar, customBar, customAnchor
     if previewHost then
         portrait, bar = previewHost.portrait, previewHost.healthBar
     else
-        portrait, bar = findTargetPortrait(), findTargetHealthBar()
+        customBar = ns.resolveFramePath(db.customHealthBar)
+        customAnchor = ns.resolveFramePath(db.customIconAnchor)
+        bar = customBar or findTargetHealthBar()
+        -- Replacement frames often have no portrait; the kill icon then sits on their health bar (offsets move it).
+        portrait = customAnchor or (customBar == nil and findTargetPortrait()) or nil
     end
-    skullAnchor = portrait or TargetFrame or UIParent
+    local signature = tostring(previewHost) .. tostring(bar) .. tostring(portrait)
+    if not force and signature == attachedSignature then return portrait ~= nil end
+    attachedSignature = signature
+
+    skullAnchor = portrait or customBar or TargetFrame or UIParent
+    local custom = customBar or customAnchor
+    visibilityFrame = (not previewHost) and (custom or TargetFrame) or nil
+    layerRoot = custom and ns.frameRoot(custom) or TargetFrame
     plainSkullFrame:ClearAllPoints()
     plainSkullFrame:SetPoint("BOTTOM", skullWindow, "TOP", 0, 4)
 
@@ -1382,8 +1481,26 @@ local function attach()
         remainingBar:SetAllPoints(healthBar)
     end
     appliedSignature = nil -- re-anchor the skull, label and effects against the (new) frames
-    trace("ATTACH portrait: " .. regionName(portrait) .. " | health bar: " .. regionName(healthBar))
-    return portrait ~= nil
+    local function describeSetting(path, found)
+        if path == "" then return "" end
+        return found and (" (custom " .. path .. ")") or (" (custom " .. path .. " NOT FOUND, using Blizzard's)")
+    end
+    trace("ATTACH portrait: " .. regionName(portrait) .. describeSetting(db.customIconAnchor, customAnchor)
+        .. " | health bar: " .. regionName(healthBar) .. describeSetting(db.customHealthBar, customBar))
+    return portrait ~= nil or customBar ~= nil
+end
+
+-- What the display is attached to, for the options window: health bar and icon lines.
+function ns.attachStatus()
+    local function line(path, found, blizzard)
+        if strtrim(path) == "" then return blizzard end
+        if found then return "|cff66ff66" .. strtrim(path) .. "|r" end
+        return "|cffff6666" .. strtrim(path) .. " not found|r, using " .. blizzard
+    end
+    local customBar = ns.resolveFramePath(db.customHealthBar)
+    local iconFallback = customBar and "the health bar" or "Blizzard's portrait"
+    return line(db.customHealthBar, customBar, "Blizzard's target frame"),
+        line(db.customIconAnchor, ns.resolveFramePath(db.customIconAnchor), iconFallback)
 end
 
 local STRATA_RANK = {
@@ -1411,7 +1528,7 @@ local function targetFrameTopLayer()
             for _, child in ipairs({ frame:GetChildren() }) do visit(child, depth + 1) end
         end
     end
-    visit(TargetFrame or healthBar or UIParent, 0)
+    visit(layerRoot or healthBar or UIParent, 0)
     return topStrata, topLevel
 end
 
@@ -1537,6 +1654,11 @@ local function refresh()
     end
 
     if not UnitExists("target") or targetIsDead() then return hideAll() end
+    -- A target frame another addon hid (or a custom one not showing): the marker would float over nothing.
+    if visibilityFrame then
+        local ok, visible = pcall(visibilityFrame.IsVisible, visibilityFrame)
+        if ok and not isSecret(visible) and not visible then return hideAll() end
+    end
     local damage, count, breakdown = targetRemainingDamage()
     if damage ~= lastTracedDamage then
         lastTracedDamage = damage
@@ -1643,6 +1765,12 @@ function ns.setDisplayHost(host)
     end
 end
 
+-- After a custom frame setting changed.
+function ns.reattach()
+    attach()
+    safeRefresh()
+end
+
 -- state: { health = 0-100, dots = { { name, school, damage }, ... } } (damage in % of max health), or nil.
 function ns.setPreviewState(state)
     previewState = state
@@ -1655,6 +1783,7 @@ end
 local frame = CreateFrame("Frame")
 frame:RegisterEvent("ADDON_LOADED")
 frame:RegisterEvent("PLAYER_TARGET_CHANGED")
+frame:RegisterEvent("PLAYER_ENTERING_WORLD")    -- custom target frames (Frames.lua) exist by then
 frame:RegisterUnitEvent("UNIT_SPELLCAST_SUCCEEDED", "player")
 frame:RegisterUnitEvent("UNIT_SPELLCAST_SENT", "player")   -- combo points, before a finisher spends them
 frame:RegisterUnitEvent("UNIT_POWER_FREQUENT", "player")   -- keeps a recent combo point reading as backup
@@ -1685,25 +1814,28 @@ frame:SetScript("OnEvent", function(self, event, ...)
     elseif not db then
         return
 
+    elseif event == "PLAYER_ENTERING_WORLD" then
+        attach()
+
     elseif event == "PLAYER_TARGET_CHANGED" then
         dotsByTarget.target = nil -- only used when the target's GUID is secret
         resetComboCount() -- combo points belong to the target they were built on
-        forgetPendingOutcomes()
         lastTracedDamage = nil
+        attach() -- custom frames may only exist (or be rebuilt) by now
         trace("TARGET changed to " .. (unitKey("target") or "none"))
         safeRefresh()
 
     elseif event == "UNIT_SPELLCAST_SENT" then
-        local _, _, _, spellID = ...
-        onCastSent(spellID)
+        local _, _, castGUID, spellID = ...
+        onCastSent(spellID, castGUID)
 
     elseif event == "UNIT_POWER_FREQUENT" then
         local _, powerType = ...
         if not isSecret(powerType) and powerType == "COMBO_POINTS" then rememberComboPoints() end
 
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
-        local _, _, spellID = ...
-        local appliedTo, waiting = onPlayerCast(spellID)
+        local _, castGUID, spellID = ...
+        local appliedTo, waiting = onPlayerCast(spellID, castGUID)
         safeRefresh()
         -- A DoT waiting for its first tick isn't drawn yet; it flashes when that tick lands instead.
         if appliedTo and not waiting and appliedTo == unitKey("target") then playFlash() end
@@ -1745,6 +1877,8 @@ SlashCmdList.DOESITDIE = function(msg)
         end
     elseif cmd == "plates" then
         ns.probeNameplates()
+    elseif cmd:match("^exec") then
+        ns.toggleExecuteProbe(tonumber(cmd:match("%d+")))
     elseif cmd == "skull" then
         skullTestUntil = GetTime() + 5
         print("Kill icon test for 5 seconds: one icon ON the portrait (the real one) and one ABOVE it (plain test).")
@@ -1761,6 +1895,7 @@ SlashCmdList.DOESITDIE = function(msg)
         print("/did line - toggle health bar markers on/off")
         print("/did skull - show the kill icon for 5 seconds to check its position")
         print("/did plates - check what the addon can reach on visible nameplates (logged)")
+        print("/did exec [percent] - test showing when the target is below 20% (or the given percent); again to stop")
         print("/did debug - toggle echoing the trace log (casts, ticks, estimates) to chat")
         print("/did reset - forget learned tick sizes")
     end
